@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: test-api
+    runtime: docker
+    plan: free
+    autoDeploy: true
