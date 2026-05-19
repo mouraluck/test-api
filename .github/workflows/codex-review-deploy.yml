@@ -1,4 +1,5 @@
 name: Codex Review and Deploy
+# NOTE: human-review gate active for High/Critical complexity PRs.
 
 on:
   pull_request:
