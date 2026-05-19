@@ -3,11 +3,13 @@ name: Codex Review and Deploy
 on:
   pull_request:
     types: [opened, reopened, synchronize, ready_for_review]
+  pull_request_review:
+    types: [submitted]
   issue_comment:
     types: [created]
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
   issues: write
 
@@ -261,19 +263,53 @@ jobs:
           INSERTED_LINES: ${{ steps.context.outputs.inserted_lines }}
           HUMAN_REVIEWERS: ${{ env.HUMAN_REVIEWERS }}
         run: |
+          gh pr edit "$PR_NUMBER" \
+            --remove-label "complexity:low" \
+            --remove-label "complexity:medium" \
+            --remove-label "complexity:high" \
+            --remove-label "complexity:critical" \
+            --remove-label "needs-human-approval" || true
+
+          band_label=$(echo "$COMPLEXITY_BAND" | tr '[:upper:]' '[:lower:]')
+          gh pr edit "$PR_NUMBER" --add-label "complexity:${band_label}" || true
+
           mention_line=""
           if [ "$COMPLEXITY_BAND" = "High" ] || [ "$COMPLEXITY_BAND" = "Critical" ]; then
+            gh pr edit "$PR_NUMBER" --add-label "needs-human-approval" || true
             if [ -n "$HUMAN_REVIEWERS" ]; then
-              gh pr edit "$PR_NUMBER" --add-reviewer "$HUMAN_REVIEWERS" || true
-              mentions=""
+              requested_mentions=""
+              skipped_mentions=""
+              failed_mentions=""
               IFS=',' read -ra reviewers <<< "$HUMAN_REVIEWERS"
               for r in "${reviewers[@]}"; do
                 trimmed=$(echo "$r" | xargs)
                 if [ -n "$trimmed" ]; then
-                  mentions="$mentions @$trimmed"
+                  if [ "$trimmed" = "$PR_AUTHOR" ]; then
+                    skipped_mentions="$skipped_mentions @$trimmed"
+                    continue
+                  fi
+
+                  if gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/requested_reviewers" \
+                    -X POST \
+                    -f reviewers[]="$trimmed" >/dev/null 2>&1; then
+                    requested_mentions="$requested_mentions @$trimmed"
+                  else
+                    failed_mentions="$failed_mentions @$trimmed"
+                  fi
                 fi
               done
-              mention_line="Additional human reviewer requested:$mentions"
+
+              if [ -n "$requested_mentions" ]; then
+                mention_line="Additional human reviewer requested:$requested_mentions"
+              elif [ -n "$failed_mentions" ]; then
+                mention_line="Failed to request human reviewer(s):$failed_mentions"
+              else
+                mention_line="No eligible additional human reviewer to request."
+              fi
+
+              if [ -n "$skipped_mentions" ]; then
+                mention_line="$mention_line (author skipped:$skipped_mentions)"
+              fi
             else
               mention_line="Additional human reviewer required for High/Critical complexity (configure CODEX_HUMAN_REVIEWERS)."
             fi
@@ -341,6 +377,7 @@ jobs:
       COMMENT_BODY: ${{ github.event.comment.body }}
       AUTHOR_ASSOCIATION: ${{ github.event.comment.author_association }}
       RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+      HUMAN_REVIEWERS: ${{ vars.CODEX_HUMAN_REVIEWERS }}
       GH_TOKEN: ${{ github.token }}
       PR_NUMBER: ${{ github.event.issue.number }}
     steps:
@@ -370,6 +407,34 @@ jobs:
             exit 0
           fi
 
+          needs_human=$(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name | select(. == "needs-human-approval")' || true)
+          if [ "$needs_human" = "needs-human-approval" ]; then
+            if [ -z "$HUMAN_REVIEWERS" ]; then
+              gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+                -f body="Deploy blocked: CODEX_HUMAN_REVIEWERS is not configured."
+              echo "run_deploy=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            approved_logins=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/reviews" --jq '[.[] | select(.state=="APPROVED") | .user.login] | unique | .[]' || true)
+            approval_ok=false
+            IFS=',' read -ra reviewers <<< "$HUMAN_REVIEWERS"
+            for r in "${reviewers[@]}"; do
+              reviewer=$(echo "$r" | xargs)
+              if [ -n "$reviewer" ] && echo "$approved_logins" | grep -qx "$reviewer"; then
+                approval_ok=true
+                break
+              fi
+            done
+
+            if [ "$approval_ok" != "true" ]; then
+              gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+                -f body="Deploy blocked: this PR requires approval from configured human reviewer(s) before deploy/merge."
+              echo "run_deploy=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
           echo "run_deploy=true" >> "$GITHUB_OUTPUT"
 
       - name: Trigger Render deploy
@@ -382,3 +447,79 @@ jobs:
         run: |
           gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
             -f body="Deploy triggered on Render via .deploy command."
+
+  deploy-and-merge-on-approval:
+    if: github.event_name == 'pull_request_review' && github.event.review.state == 'approved' && github.event.pull_request.state == 'open'
+    runs-on: ubuntu-latest
+    environment:
+      name: test-env
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      REVIEWER_LOGIN: ${{ github.event.review.user.login }}
+      PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+      HUMAN_REVIEWERS: ${{ vars.CODEX_HUMAN_REVIEWERS }}
+      RENDER_DEPLOY_HOOK_URL: ${{ secrets.RENDER_DEPLOY_HOOK_URL }}
+    steps:
+      - name: Verify approval gate
+        id: gate
+        run: |
+          needs_human=$(gh pr view "$PR_NUMBER" --json labels --jq '.labels[].name | select(. == "needs-human-approval")' || true)
+          if [ "$needs_human" != "needs-human-approval" ]; then
+            echo "run_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$REVIEWER_LOGIN" = "$PR_AUTHOR" ]; then
+            echo "run_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$HUMAN_REVIEWERS" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              -f body="Release blocked: CODEX_HUMAN_REVIEWERS is not configured."
+            echo "run_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          reviewer_allowed=false
+          IFS=',' read -ra reviewers <<< "$HUMAN_REVIEWERS"
+          for r in "${reviewers[@]}"; do
+            reviewer=$(echo "$r" | xargs)
+            if [ -n "$reviewer" ] && [ "$reviewer" = "$REVIEWER_LOGIN" ]; then
+              reviewer_allowed=true
+              break
+            fi
+          done
+
+          if [ "$reviewer_allowed" != "true" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              -f body="Release blocked: approval by @$REVIEWER_LOGIN is not in CODEX_HUMAN_REVIEWERS."
+            echo "run_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -z "$RENDER_DEPLOY_HOOK_URL" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              -f body="Release blocked: missing secret RENDER_DEPLOY_HOOK_URL."
+            echo "run_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "run_release=true" >> "$GITHUB_OUTPUT"
+
+      - name: Trigger Render deploy
+        if: steps.gate.outputs.run_release == 'true'
+        run: |
+          curl -fsS -X POST "$RENDER_DEPLOY_HOOK_URL"
+
+      - name: Enable auto-merge
+        if: steps.gate.outputs.run_release == 'true'
+        run: |
+          gh pr merge "$PR_NUMBER" --auto --squash
+
+      - name: Confirm release gate success
+        if: steps.gate.outputs.run_release == 'true'
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+            -f body="Human approval by @$REVIEWER_LOGIN validated. Deploy triggered and auto-merge enabled."
