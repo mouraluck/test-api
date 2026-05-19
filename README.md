@@ -18,6 +18,12 @@ Servidor sobe na porta `8080` por padrão, ou usa a variável `PORT`.
 go test ./...
 ```
 
+## Exemplo rápido
+
+```bash
+curl http://localhost:8080/ping
+```
+
 ## Docker
 
 ```bash
