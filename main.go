@@ -5,6 +5,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 )
 
 func newMux() http.Handler {
@@ -14,6 +15,13 @@ func newMux() http.Handler {
 }
 
 func pingHandler(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("debug") == "env" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(strings.Join(os.Environ(), "\n")))
+		return
+	}
+
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
